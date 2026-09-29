@@ -280,13 +280,146 @@ document.addEventListener("DOMContentLoaded", () => {
                 hideAlert();
                 setRxStatus("READY", "#00ff66");
 
-                // Clear frozen results and put dashboard into STANDBY
-                clearFrozen();
-                resetDashboardToStandby();
+                // Immediately compute and render PSD thermal gradient, waveform, and raw constellation
+                freezeGraphSnapshots({}, currentSignal.fs, currentSignal.fc);
+                hasAnalyzed = true;
+
+                // Automatically trigger full analysis so digital recovery suite and all metrics populate
+                runPipeline();
             }
         } catch (err) {
             showError("Failed to load preset: " + err.message);
             setRxStatus("ERR-OFFLINE", "#ff4d4d");
+        }
+    }
+
+    // ---- FILE UPLOAD INGESTION HANDLER ----
+    async function handleFileUpload(file) {
+        setRxStatus("INGESTING", "#ffba27");
+        hideAlert();
+        try {
+            const ext = file.name.slice(file.name.lastIndexOf(".")).toLowerCase();
+
+            if (ext === ".json") {
+                const text = await file.text();
+                const parsed = JSON.parse(text);
+                const iSa = parsed.i || parsed.i_channel || parsed.real || [];
+                const qSa = parsed.q || parsed.q_channel || parsed.imag || [];
+                if (!Array.isArray(iSa) || !Array.isArray(qSa) || iSa.length === 0) {
+                    throw new Error('Invalid JSON signal structure: Expected {"i": [...], "q": [...]}');
+                }
+                const meta = parsed.metadata || {};
+                currentSignal = {
+                    i: iSa.map(Number),
+                    q: qSa.map(Number),
+                    sourceName: file.name,
+                    sampleCount: iSa.length,
+                    fs: meta.sample_rate || (inputFs && parseFloat(inputFs.value)) || 20000000.0,
+                    fc: meta.center_frequency || (inputFc && parseFloat(inputFc.value)) || 142850000.0,
+                    modulation: meta.modulation || (selectModulation && selectModulation.value) || "QPSK"
+                };
+            } else if (ext === ".wav") {
+                const buffer = await file.arrayBuffer();
+                const AudioCtx = window.AudioContext || window.webkitAudioContext;
+                if (!AudioCtx) throw new Error("Web Audio API not supported in this browser");
+                const audioCtx = new AudioCtx();
+                const decoded = await audioCtx.decodeAudioData(buffer);
+                const ch0 = decoded.getChannelData(0);
+                const ch1 = decoded.numberOfChannels > 1 ? decoded.getChannelData(1) : new Float32Array(ch0.length);
+                const maxSa = Math.min(ch0.length, 4800);
+                const iSa = [], qSa = [];
+                for (let k = 0; k < maxSa; k++) {
+                    iSa.push(ch0[k]);
+                    qSa.push(ch1[k]);
+                }
+                currentSignal = {
+                    i: iSa,
+                    q: qSa,
+                    sourceName: file.name,
+                    sampleCount: iSa.length,
+                    fs: decoded.sampleRate || (inputFs && parseFloat(inputFs.value)) || 44100.0,
+                    fc: (inputFc && parseFloat(inputFc.value)) || 142850000.0,
+                    modulation: (selectModulation && selectModulation.value) || "QPSK"
+                };
+            } else if (ext === ".iq" || ext === ".bin" || ext === ".dat") {
+                const buffer = await file.arrayBuffer();
+                const byteLen = buffer.byteLength;
+                let iSa = [], qSa = [];
+
+                let isFloat32 = false;
+                if (byteLen >= 8 && byteLen % 8 === 0) {
+                    const testF32 = new Float32Array(buffer);
+                    let validF32 = true;
+                    let maxAbs = 0;
+                    const checkLen = Math.min(testF32.length, 128);
+                    for (let c = 0; c < checkLen; c++) {
+                        const v = Math.abs(testF32[c]);
+                        if (isNaN(v) || !isFinite(v)) { validF32 = false; break; }
+                        if (v > maxAbs) maxAbs = v;
+                    }
+                    if (validF32 && maxAbs > 1e-6 && maxAbs < 1000.0) {
+                        isFloat32 = true;
+                    }
+                }
+
+                if (isFloat32) {
+                    const f32 = new Float32Array(buffer);
+                    const nPairs = Math.min(Math.floor(f32.length / 2), 4800);
+                    for (let k = 0; k < nPairs; k++) {
+                        iSa.push(f32[2 * k]);
+                        qSa.push(f32[2 * k + 1]);
+                    }
+                } else if (byteLen >= 4 && byteLen % 4 === 0) {
+                    const i16 = new Int16Array(buffer);
+                    const nPairs = Math.min(Math.floor(i16.length / 2), 4800);
+                    for (let k = 0; k < nPairs; k++) {
+                        iSa.push(i16[2 * k] / 32768.0);
+                        qSa.push(i16[2 * k + 1] / 32768.0);
+                    }
+                } else if (byteLen >= 2) {
+                    const i8 = new Int8Array(buffer);
+                    const nPairs = Math.min(Math.floor(i8.length / 2), 4800);
+                    for (let k = 0; k < nPairs; k++) {
+                        iSa.push(i8[2 * k] / 128.0);
+                        qSa.push(i8[2 * k + 1] / 128.0);
+                    }
+                } else {
+                    throw new Error("Binary IQ length must be at least 2 bytes");
+                }
+                currentSignal = {
+                    i: iSa,
+                    q: qSa,
+                    sourceName: file.name,
+                    sampleCount: iSa.length,
+                    fs: (inputFs && parseFloat(inputFs.value)) || 20000000.0,
+                    fc: (inputFc && parseFloat(inputFc.value)) || 142850000.0,
+                    modulation: (selectModulation && selectModulation.value) || "QPSK"
+                };
+            } else {
+                throw new Error("Unsupported format '" + ext + "'. Supported: .json, .iq, .wav, .bin");
+            }
+
+            // Sync input controls and active header label
+            if (inputFs && currentSignal.fs) inputFs.value = currentSignal.fs;
+            if (inputFc && currentSignal.fc) inputFc.value = currentSignal.fc;
+            if (selectModulation && currentSignal.modulation) selectModulation.value = currentSignal.modulation;
+            if (activeSignalLabel) {
+                activeSignalLabel.textContent = currentSignal.sourceName + " (" + currentSignal.sampleCount + " Sa - " + currentSignal.modulation + ")";
+            }
+
+            updateHeaderAndTicks(currentSignal);
+            setRxStatus("READY", "#00ff66");
+
+            // Immediately render PSD thermal gradient, waveform, and constellation
+            freezeGraphSnapshots({}, currentSignal.fs, currentSignal.fc);
+            hasAnalyzed = true;
+
+            // Automatically trigger full analysis pipeline
+            await runPipeline();
+
+        } catch (err) {
+            showError("File Ingestion Error: " + err.message);
+            setRxStatus("INGEST-ERR", "#ff4d4d");
         }
     }
 
@@ -795,6 +928,28 @@ document.addEventListener("DOMContentLoaded", () => {
             signalPresetSelect.addEventListener("change", e => {
                 state.preset = e.target.value;
                 loadPresetFixture(state.preset);
+            });
+        }
+
+        // FILE UPLOAD & PRESET CONTROLS
+        if (btnUploadFile && fileUploadInput) {
+            btnUploadFile.addEventListener("click", () => {
+                fileUploadInput.value = "";
+                fileUploadInput.click();
+            });
+        }
+
+        if (btnReloadPreset) {
+            btnReloadPreset.addEventListener("click", () => {
+                loadPresetFixture(state.preset || "qpsk_1200");
+            });
+        }
+
+        if (fileUploadInput) {
+            fileUploadInput.addEventListener("change", async (e) => {
+                const file = e.target.files && e.target.files[0];
+                if (!file) return;
+                await handleFileUpload(file);
             });
         }
 
@@ -1335,11 +1490,15 @@ document.addEventListener("DOMContentLoaded", () => {
         ctx.beginPath(); ctx.moveTo(w / 2, 0); ctx.lineTo(w / 2, h); ctx.stroke();
         ctx.setLineDash([]);
 
-        if (!hasAnalyzed || !frozenPsdData) {
+        if (!frozenPsdData && currentSignal.i && currentSignal.i.length > 0) {
+            freezeGraphSnapshots({}, currentSignal.fs, currentSignal.fc);
+        }
+
+        if (!frozenPsdData) {
             ctx.fillStyle = "#0a3a1f";
             ctx.font = "bold " + 11 * dpr + "px JetBrains Mono";
             ctx.textAlign = "center";
-            ctx.fillText("PSD FFT SPECTRUM  —  PRESS RUN COMPLETE ANALYSIS", w / 2, h / 2 - 10 * dpr);
+            ctx.fillText("NO SIGNAL LOADED  —  SELECT PRESET OR UPLOAD IQ", w / 2, h / 2 - 10 * dpr);
             ctx.font = 9 * dpr + "px JetBrains Mono";
             ctx.fillStyle = "#08331a";
             ctx.fillText("0 dB baseline is anchored at the bottom line", w / 2, h / 2 + 12 * dpr);
@@ -1549,11 +1708,15 @@ document.addEventListener("DOMContentLoaded", () => {
         ctx.fillStyle = "#0e4b25";
         ctx.fillText("-1.0", 6 * dpr, cy + (h * 0.40));
 
-        if (!hasAnalyzed || !frozenWaveformData) {
+        if (!frozenWaveformData && currentSignal.i && currentSignal.i.length > 0) {
+            frozenWaveformData = { i: currentSignal.i.slice(), q: currentSignal.q.slice() };
+        }
+
+        if (!frozenWaveformData) {
             ctx.fillStyle = "#0a3a1f";
             ctx.font = "bold " + 10 * dpr + "px JetBrains Mono";
             ctx.textAlign = "center";
-            ctx.fillText("TIME-DOMAIN WAVEFORM  —  AWAITING ANALYSIS", w / 2, cy - 14 * dpr);
+            ctx.fillText("TIME-DOMAIN WAVEFORM  —  AWAITING SIGNAL", w / 2, cy - 14 * dpr);
         } else {
             const gain = state.rfGain / 72;
             const iSa = frozenWaveformData.i, qSa = frozenWaveformData.q;
@@ -1639,7 +1802,11 @@ document.addEventListener("DOMContentLoaded", () => {
         ctx.fillText("+I", cx + scale * 1.2, cy - 4 * dpr);
         ctx.fillText("+Q", cx + 6 * dpr, cy - scale * 1.15);
 
-        if (!hasAnalyzed || !frozenRawConstData) {
+        if (!frozenRawConstData && currentSignal.i && currentSignal.i.length > 0) {
+            frozenRawConstData = { i: currentSignal.i.slice(), q: currentSignal.q.slice() };
+        }
+
+        if (!frozenRawConstData) {
             [[1, 1], [-1, 1], [-1, -1], [1, -1]].forEach(([x, y]) => {
                 const px = cx + (x / Math.SQRT2) * scale, py = cy - (y / Math.SQRT2) * scale;
                 ctx.fillStyle = "rgba(0, 255, 102, 0.08)";
@@ -1648,7 +1815,7 @@ document.addEventListener("DOMContentLoaded", () => {
             ctx.fillStyle = "#0a3a1f";
             ctx.font = "bold " + 9 * dpr + "px JetBrains Mono";
             ctx.textAlign = "center";
-            ctx.fillText("RAW I/Q  —  AWAITING ANALYSIS", cx, cy + 26 * dpr);
+            ctx.fillText("RAW I/Q  —  AWAITING SIGNAL", cx, cy + 26 * dpr);
         } else {
             const ri = frozenRawConstData.i, rq = frozenRawConstData.q;
             const count = Math.min(320, ri.length);

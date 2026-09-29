@@ -85,7 +85,27 @@ if not os.path.exists(frontend_dir):
     if os.path.exists(candidate):
         frontend_dir = candidate
 
-# Mount Frontend-Experimental / Radar LabView directory
+if os.path.exists(frontend_dir):
+    app.mount("/static", StaticFiles(directory=frontend_dir), name="static")
+
+    @app.get("/")
+    @app.get("/exp")
+    @app.get("/experimental")
+    @app.get("/radar")
+    @app.get("/radar-labview")
+    @app.get("/Frontend-Experimental")
+    def serve_frontend_index():
+        return FileResponse(os.path.join(frontend_dir, "index.html"))
+
+    @app.get("/app.js")
+    def serve_frontend_js():
+        return FileResponse(os.path.join(frontend_dir, "app.js"), media_type="application/javascript")
+
+    @app.get("/style.css")
+    def serve_frontend_css():
+        return FileResponse(os.path.join(frontend_dir, "style.css"), media_type="text/css")
+
+# Also mount Frontend-Experimental / Radar LabView static directory for alias compatibility
 candidates = [
     os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "Frontend-Experimental"),
     os.path.join(os.getcwd(), "Frontend-Experimental"),
@@ -94,41 +114,26 @@ candidates = [
 ]
 experimental_dir = next((c for c in candidates if os.path.exists(c)), None)
 
-# Mount /static for friend's frontend assets
-if frontend_dir and os.path.exists(frontend_dir):
-    app.mount("/static", StaticFiles(directory=frontend_dir), name="static")
-
-    @app.get("/classic")
-    @app.get("/friend")
-    @app.get("/v1")
-    def serve_friend_index():
-        return FileResponse(os.path.join(frontend_dir, "index.html"))
-
-# Make Experimental Radar / Phosphor LabView the PRIMARY FRONTEND at /
 if experimental_dir:
     app.mount("/experimental", StaticFiles(directory=experimental_dir, html=True), name="experimental")
 
-    @app.get("/")
-    @app.get("/exp")
-    @app.get("/radar")
-    @app.get("/radar-labview")
-    @app.get("/Frontend-Experimental")
-    def serve_radar_main_index():
-        return FileResponse(os.path.join(experimental_dir, "index.html"))
-
-    @app.get("/app.js")
-    def serve_radar_js():
-        return FileResponse(os.path.join(experimental_dir, "app.js"), media_type="application/javascript")
-
-    @app.get("/style.css")
-    def serve_radar_css():
-        return FileResponse(os.path.join(experimental_dir, "style.css"), media_type="text/css")
-
-elif frontend_dir and os.path.exists(frontend_dir):
-    @app.get("/")
-    def serve_fallback_index():
-        return FileResponse(os.path.join(frontend_dir, "index.html"))
-
 @app.get("/favicon.ico")
 def favicon():
+    ico_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "favicon.ico")
+    if os.path.exists(ico_path):
+        return FileResponse(ico_path, media_type="image/x-icon")
+    candidate = os.path.join(os.getcwd(), "favicon.ico")
+    if os.path.exists(candidate):
+        return FileResponse(candidate, media_type="image/x-icon")
     return Response(status_code=204)
+
+@app.get("/favicon.svg")
+def favicon_svg():
+    svg_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "favicon.svg")
+    if os.path.exists(svg_path):
+        return FileResponse(svg_path, media_type="image/svg+xml")
+    candidate = os.path.join(os.getcwd(), "favicon.svg")
+    if os.path.exists(candidate):
+        return FileResponse(candidate, media_type="image/svg+xml")
+    return Response(status_code=204)
+
