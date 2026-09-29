@@ -528,6 +528,151 @@ document.addEventListener("DOMContentLoaded", () => {
         }
     }
 
+    // ---- PURE-JS RIFF WAV BINARY DECODER (Zero-dependency, supports SDR 1 MSa/s, 32-bit float, 16-bit PCM, Extensible) ----
+    function parseWavArrayBuffer(buffer) {
+        const view = new DataView(buffer);
+        const len = buffer.byteLength;
+        if (len < 12) throw new Error("File too small to be a valid WAV file");
+
+        const riff = String.fromCharCode(view.getUint8(0), view.getUint8(1), view.getUint8(2), view.getUint8(3));
+        const wave = String.fromCharCode(view.getUint8(8), view.getUint8(9), view.getUint8(10), view.getUint8(11));
+        if (riff !== "RIFF" && riff !== "RIFX") {
+            throw new Error("Invalid WAV: Missing RIFF signature");
+        }
+        if (wave !== "WAVE") {
+            throw new Error("Invalid WAV: Missing WAVE format");
+        }
+        const isLittleEndian = (riff === "RIFF");
+
+        let offset = 12;
+        let fmt = null;
+        let dataOffset = -1;
+        let dataLen = 0;
+
+        while (offset + 8 <= len) {
+            const chunkId = String.fromCharCode(
+                view.getUint8(offset),
+                view.getUint8(offset + 1),
+                view.getUint8(offset + 2),
+                view.getUint8(offset + 3)
+            );
+            const chunkSize = view.getUint32(offset + 4, isLittleEndian);
+            const chunkDataPos = offset + 8;
+
+            if (chunkId === "fmt ") {
+                if (chunkSize >= 16) {
+                    const audioFormat = view.getUint16(chunkDataPos, isLittleEndian);
+                    const numChannels = view.getUint16(chunkDataPos + 2, isLittleEndian);
+                    const sampleRate = view.getUint32(chunkDataPos + 4, isLittleEndian);
+                    const byteRate = view.getUint32(chunkDataPos + 8, isLittleEndian);
+                    const blockAlign = view.getUint16(chunkDataPos + 12, isLittleEndian);
+                    const bitsPerSample = view.getUint16(chunkDataPos + 14, isLittleEndian);
+
+                    let actualFormat = audioFormat;
+                    if (audioFormat === 0xFFFE && chunkSize >= 40) { // WAVE_FORMAT_EXTENSIBLE
+                        actualFormat = view.getUint16(chunkDataPos + 24, isLittleEndian);
+                    }
+
+                    fmt = {
+                        audioFormat: actualFormat,
+                        numChannels,
+                        sampleRate,
+                        byteRate,
+                        blockAlign,
+                        bitsPerSample
+                    };
+                    if (dataOffset >= 0) break;
+                }
+            } else if (chunkId === "data") {
+                dataOffset = chunkDataPos;
+                const remaining = Math.max(0, len - chunkDataPos);
+                dataLen = (chunkSize > 0 && chunkSize <= remaining) ? chunkSize : remaining;
+                if (fmt) break;
+            }
+
+            offset = chunkDataPos + chunkSize;
+            if (chunkSize % 2 !== 0) offset += 1;
+        }
+
+        if (!fmt) throw new Error("Invalid WAV: Missing 'fmt ' subchunk");
+        if (dataOffset < 0 || dataLen <= 0) throw new Error("Invalid WAV: Missing 'data' payload subchunk");
+
+        const { audioFormat, numChannels, sampleRate, bitsPerSample, blockAlign } = fmt;
+        const bytesPerSample = Math.floor(bitsPerSample / 8) || 2;
+        const bytesPerFrame = blockAlign || (numChannels * bytesPerSample);
+        const totalFrames = Math.floor(dataLen / bytesPerFrame);
+        const maxFrames = Math.min(totalFrames, 4800);
+
+        const iSa = new Array(maxFrames);
+        const qSa = new Array(maxFrames);
+
+        for (let f = 0; f < maxFrames; f++) {
+            const framePos = dataOffset + f * bytesPerFrame;
+            let ch0 = 0, ch1 = 0;
+
+            if (audioFormat === 3) { // IEEE 32-bit or 64-bit float
+                if (bitsPerSample === 32) {
+                    ch0 = view.getFloat32(framePos, isLittleEndian);
+                    ch1 = numChannels > 1 ? view.getFloat32(framePos + 4, isLittleEndian) : 0;
+                } else if (bitsPerSample === 64) {
+                    ch0 = view.getFloat64(framePos, isLittleEndian);
+                    ch1 = numChannels > 1 ? view.getFloat64(framePos + 8, isLittleEndian) : 0;
+                }
+            } else { // PCM Integer formats
+                if (bitsPerSample === 16) {
+                    ch0 = view.getInt16(framePos, isLittleEndian) / 32768.0;
+                    ch1 = numChannels > 1 ? view.getInt16(framePos + 2, isLittleEndian) / 32768.0 : 0;
+                } else if (bitsPerSample === 8) {
+                    ch0 = (view.getUint8(framePos) - 128) / 128.0;
+                    ch1 = numChannels > 1 ? (view.getUint8(framePos + 1) - 128) / 128.0 : 0;
+                } else if (bitsPerSample === 24) {
+                    let b0 = view.getUint8(framePos);
+                    let b1 = view.getUint8(framePos + 1);
+                    let b2 = view.getUint8(framePos + 2);
+                    let val0 = (b0 | (b1 << 8) | (b2 << 16));
+                    if (val0 & 0x800000) val0 |= 0xFF000000;
+                    ch0 = val0 / 8388608.0;
+
+                    if (numChannels > 1) {
+                        let c0 = view.getUint8(framePos + 3);
+                        let c1 = view.getUint8(framePos + 4);
+                        let c2 = view.getUint8(framePos + 5);
+                        let val1 = (c0 | (c1 << 8) | (c2 << 16));
+                        if (val1 & 0x800000) val1 |= 0xFF000000;
+                        ch1 = val1 / 8388608.0;
+                    }
+                } else if (bitsPerSample === 32) {
+                    ch0 = view.getInt32(framePos, isLittleEndian) / 2147483648.0;
+                    ch1 = numChannels > 1 ? view.getInt32(framePos + 4, isLittleEndian) / 2147483648.0 : 0;
+                }
+            }
+
+            iSa[f] = isFinite(ch0) ? ch0 : 0;
+            qSa[f] = isFinite(ch1) ? ch1 : 0;
+        }
+
+        // Mono signal quadrature synthesis via Hilbert transform filter
+        if (numChannels === 1) {
+            for (let k = 0; k < maxFrames; k++) {
+                let qVal = 0;
+                for (let m = -15; m <= 15; m += 2) {
+                    const idx = k - m;
+                    if (idx >= 0 && idx < maxFrames) {
+                        qVal += (2.0 / (Math.PI * m)) * iSa[idx];
+                    }
+                }
+                qSa[k] = qVal;
+            }
+        }
+
+        return {
+            i: iSa,
+            q: qSa,
+            sampleRate: sampleRate || 44100,
+            numChannels
+        };
+    }
+
     // ---- FILE UPLOAD INGESTION HANDLER ----
     async function handleFileUpload(file) {
         setRxStatus("INGESTING", "#ffba27");
@@ -555,24 +700,49 @@ document.addEventListener("DOMContentLoaded", () => {
                 };
             } else if (ext === ".wav") {
                 const buffer = await file.arrayBuffer();
-                const AudioCtx = window.AudioContext || window.webkitAudioContext;
-                if (!AudioCtx) throw new Error("Web Audio API not supported in this browser");
-                const audioCtx = new AudioCtx();
-                const decoded = await audioCtx.decodeAudioData(buffer);
-                const ch0 = decoded.getChannelData(0);
-                const ch1 = decoded.numberOfChannels > 1 ? decoded.getChannelData(1) : new Float32Array(ch0.length);
-                const maxSa = Math.min(ch0.length, 4800);
-                const iSa = [], qSa = [];
-                for (let k = 0; k < maxSa; k++) {
-                    iSa.push(ch0[k]);
-                    qSa.push(ch1[k]);
+                let iSa = [], qSa = [];
+                let detectedFs = 44100.0;
+                let parsedSuccess = false;
+
+                // 1. Direct Pure-JS RIFF Binary Parser (handles SDR 1 MSa/s, 2 MSa/s, 32-bit float, 16-bit PCM, Extensible)
+                try {
+                    const parsedWav = parseWavArrayBuffer(buffer);
+                    iSa = parsedWav.i;
+                    qSa = parsedWav.q;
+                    detectedFs = parsedWav.sampleRate || 44100.0;
+                    parsedSuccess = true;
+                } catch (binaryErr) {
+                    console.warn("Direct RIFF parser encountered non-standard chunk, attempting Web Audio API fallback:", binaryErr);
                 }
+
+                // 2. Fallback: Browser Web Audio API decodeAudioData
+                if (!parsedSuccess) {
+                    try {
+                        const AudioCtx = window.AudioContext || window.webkitAudioContext;
+                        if (!AudioCtx) throw new Error("Web Audio API not supported in this browser");
+                        const audioCtx = new AudioCtx();
+                        const decoded = await audioCtx.decodeAudioData(buffer.slice(0));
+                        const ch0 = decoded.getChannelData(0);
+                        const ch1 = decoded.numberOfChannels > 1 ? decoded.getChannelData(1) : new Float32Array(ch0.length);
+                        const maxSa = Math.min(ch0.length, 4800);
+                        for (let k = 0; k < maxSa; k++) {
+                            iSa.push(ch0[k]);
+                            qSa.push(ch1[k]);
+                        }
+                        detectedFs = decoded.sampleRate || 44100.0;
+                        parsedSuccess = true;
+                        await audioCtx.close().catch(() => {});
+                    } catch (audioErr) {
+                        throw new Error("Unable to decode WAV audio data: " + (audioErr.message || "Unsupported format or corrupt RIFF header"));
+                    }
+                }
+
                 currentSignal = {
                     i: iSa,
                     q: qSa,
                     sourceName: file.name,
                     sampleCount: iSa.length,
-                    fs: decoded.sampleRate || (inputFs && parseFloat(inputFs.value)) || 44100.0,
+                    fs: detectedFs || (inputFs && parseFloat(inputFs.value)) || 44100.0,
                     fc: (inputFc && parseFloat(inputFc.value)) || 142850000.0,
                     modulation: (selectModulation && selectModulation.value) || "QPSK"
                 };
